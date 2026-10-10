@@ -1,6 +1,7 @@
 # Ignore everything unless explicitly allowed below.
 /*
 !/.gitignore
+!/LICENSE
 !/skills/
 
 /skills/*
