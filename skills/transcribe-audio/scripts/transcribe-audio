@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=common.sh
+source "$script_dir/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  transcribe-audio [options] <media-file> [...]
+  transcribe-audio --setup [--model NAME]
+  transcribe-audio --status
+  transcribe-audio --list-models
+
+Options:
+  --model NAME          Whisper model (default: small.en)
+  --language CODE|auto  Spoken language (default: en for .en models; auto otherwise)
+  --prompt TEXT         Seed names, acronyms, or specialized vocabulary
+  --txt                 Also write a plain-text transcript
+  --json                Also write detailed JSON output
+  --gpu                 Enable GPU acceleration; retry on CPU if unavailable
+  --force               Replace existing selected outputs
+  -h, --help            Show this help
+
+By default, writes <basename>.transcript.srt beside each input.
+Use --txt and/or --json to additionally write .transcript.txt and
+.transcript.json outputs.
+EOF
+}
+
+if [[ "${1:-}" == "--setup" ]]; then
+  shift
+  exec "$script_dir/setup" "$@"
+fi
+
+if [[ "${1:-}" == "--status" ]]; then
+  exec "$script_dir/setup" --status
+fi
+
+if [[ "${1:-}" == "--list-models" ]]; then
+  print_models
+  exit 0
+fi
+
+model="small.en"
+language=""
+prompt=""
+write_txt=0
+write_json=0
+gpu=0
+force=0
+inputs=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      [[ $# -ge 2 ]] || die "--model requires a value"
+      model="$2"
+      shift 2
+      ;;
+    --language)
+      [[ $# -ge 2 ]] || die "--language requires a value"
+      language="$2"
+      shift 2
+      ;;
+    --prompt)
+      [[ $# -ge 2 ]] || die "--prompt requires text"
+      prompt="$2"
+      shift 2
+      ;;
+    --txt)
+      write_txt=1
+      shift
+      ;;
+    --json)
+      write_json=1
+      shift
+      ;;
+    --gpu)
+      gpu=1
+      shift
+      ;;
+    --force)
+      force=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        inputs+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      inputs+=("$1")
+      shift
+      ;;
+  esac
+done
+
+[[ ${#inputs[@]} -gt 0 ]] || {
+  usage >&2
+  exit 2
+}
+
+validate_model "$model" || {
+  print_models >&2
+  die "unsupported model: $model"
+}
+
+if [[ -z "$language" ]]; then
+  if model_is_english_only "$model"; then
+    language="en"
+  else
+    language="auto"
+  fi
+fi
+
+if model_is_english_only "$model" && [[ "$language" != "en" ]]; then
+  die "model '$model' is English-only; use --language en or choose a multilingual model"
+fi
+
+command -v whisper-cli >/dev/null 2>&1 || die "whisper-cli is missing; run: $script_dir/transcribe-audio --setup --model $model"
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is missing; run: $script_dir/transcribe-audio --setup --model $model"
+
+model_path="$(model_path "$model")"
+[[ -f "$model_path" ]] || die "model '$model' is missing; run: $script_dir/transcribe-audio --setup --model $model"
+verify_model "$model" "$model_path" || die "model checksum failed: $model_path"
+
+for input in "${inputs[@]}"; do
+  [[ -f "$input" ]] || die "input is not a file: $input"
+  input_dir="$(cd "$(dirname "$input")" && pwd -P)"
+  input_name="$(basename "$input")"
+  case "$input_name" in
+    *.*) input_stem="${input_name%.*}" ;;
+    *) input_stem="$input_name" ;;
+  esac
+  selected_outputs=("$input_dir/$input_stem.transcript.srt")
+  [[ $write_txt -eq 1 ]] && selected_outputs+=("$input_dir/$input_stem.transcript.txt")
+  [[ $write_json -eq 1 ]] && selected_outputs+=("$input_dir/$input_stem.transcript.json")
+  if [[ $force -ne 1 ]]; then
+    for output in "${selected_outputs[@]}"; do
+      [[ ! -e "$output" ]] || die "output already exists: $output (use --force to replace it)"
+    done
+  fi
+done
+
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/transcribe-audio.XXXXXX")"
+cleanup() {
+  if [[ -n "${work_dir:-}" && -d "$work_dir" ]]; then
+    rm -rf -- "$work_dir"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+index=0
+for input in "${inputs[@]}"; do
+  input_dir="$(cd "$(dirname "$input")" && pwd -P)"
+  input_name="$(basename "$input")"
+  case "$input_name" in
+    *.*) input_stem="${input_name%.*}" ;;
+    *) input_stem="$input_name" ;;
+  esac
+  wav="$work_dir/input-$index.wav"
+  result_stem="$work_dir/result-$index"
+
+  printf 'Preparing %s\n' "$input"
+  ffmpeg -hide_banner -loglevel error -y -i "$input" -ar 16000 -ac 1 -c:a pcm_s16le "$wav"
+
+  whisper_args=(
+    --model "$model_path"
+    --file "$wav"
+    --language "$language"
+    --output-srt
+    --output-file "$result_stem"
+  )
+  [[ $write_txt -eq 1 ]] && whisper_args+=(--output-txt)
+  [[ $write_json -eq 1 ]] && whisper_args+=(--output-json-full)
+  if [[ -n "$prompt" ]]; then
+    whisper_args+=(--prompt "$prompt")
+  fi
+
+  printf 'Transcribing with %s\n' "$model"
+  if [[ $gpu -eq 1 ]]; then
+    if whisper-cli "${whisper_args[@]}"; then
+      :
+    else
+      printf 'GPU transcription failed; retrying once on CPU.\n' >&2
+      rm -f -- "$result_stem.srt" "$result_stem.txt" "$result_stem.json"
+      whisper-cli --no-gpu "${whisper_args[@]}"
+    fi
+  else
+    whisper-cli --no-gpu "${whisper_args[@]}"
+  fi
+
+  generated_exts=(srt)
+  [[ $write_txt -eq 1 ]] && generated_exts+=(txt)
+  [[ $write_json -eq 1 ]] && generated_exts+=(json)
+  for extension in "${generated_exts[@]}"; do
+    [[ -s "$result_stem.$extension" ]] || die "Whisper produced no $extension output for: $input"
+  done
+  for extension in "${generated_exts[@]}"; do
+    output="$input_dir/$input_stem.transcript.$extension"
+    mv -f -- "$result_stem.$extension" "$output"
+    printf 'Wrote %s\n' "$output"
+  done
+  index=$((index + 1))
+done

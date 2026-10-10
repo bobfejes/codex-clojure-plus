@@ -1,0 +1,4 @@
+interface:
+  display_name: "Transcribe Audio"
+  short_description: "Offline file transcription with Whisper.cpp"
+  default_prompt: "Use $transcribe-audio to transcribe these local audio files."

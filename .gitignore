@@ -1,0 +1,11 @@
+# Ignore everything unless explicitly allowed below.
+/*
+!/.gitignore
+!/skills/
+
+/skills/*
+!/skills/transcribe-audio/
+
+# Keep generated Python files out of the transcription skill.
+__pycache__/
+*.py[cod]
