@@ -1,4 +1,4 @@
-# Agent Globcal Preferences
+# Agent Global Preferences
 
 ## Writing
 Write prose about 80% of the way to ASD-STE100: short sentences, common words,
